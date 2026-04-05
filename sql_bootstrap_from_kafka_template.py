@@ -123,7 +123,7 @@ def create_schema_and_tables(cur):
         );
     """)
 
-    # Additional entity chosen by us: shades affecting generator
+    # Additional entity: shades affecting generator
     cur.execute("""
         CREATE TABLE generator_shade (
             shade_id SERIAL PRIMARY KEY,
@@ -134,6 +134,37 @@ def create_schema_and_tables(cur):
         );
     """)
 
+
+    # Abnormal Event
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS anomalies (
+            anomaly_id SERIAL PRIMARY KEY,
+            home_id TEXT NOT NULL REFERENCES home(home_id) ON DELETE CASCADE,
+            device_id TEXT REFERENCES device(device_id) ON DELETE SET NULL,
+            timestamp TIMESTAMPTZ NOT NULL,
+            anomaly_type TEXT NOT NULL,
+            description TEXT,
+            severity INT CHECK (severity BETWEEN 1 AND 5),
+            resolved BOOLEAN DEFAULT FALSE
+        );
+    """)
+
+    # Energy Bills
+    cur.execute("""
+         CREATE TABLE IF NOT EXISTS energy_bills (
+             bill_id SERIAL PRIMARY KEY,
+             home_id TEXT NOT NULL REFERENCES home(home_id) ON DELETE CASCADE,
+             tariff_id INT NOT NULL REFERENCES tariffs(tariff_id) ON DELETE RESTRICT,
+             billing_period_start DATE NOT NULL,
+             billing_period_end DATE NOT NULL,
+             total_consumption_kwh FLOAT NOT NULL,
+             total_cost FLOAT NOT NULL,
+             generation_kwh FLOAT,
+             grid_import_kwh FLOAT,
+             grid_export_kwh FLOAT,
+             CHECK (billing_period_start < billing_period_end)
+         );
+     """)
 
 
 # ---------------------------------------------------------------------
@@ -267,6 +298,115 @@ def insert_data(cur, data):
                     shade_idx,
                     shade_label
                 ))
+
+    # -----------------------------------------------------------------
+    # Mock data for additional tables
+    # -----------------------------------------------------------------
+    import random
+    from datetime import datetime, timedelta
+
+    # Homes with their actual tariffs
+    cur.execute("SELECT home_id, tariff_id FROM home;")
+    homes_with_tariffs = cur.fetchall()
+    home_ids = [home_id for home_id, _ in homes_with_tariffs]
+    home_tariff_map = {home_id: tariff_id for home_id, tariff_id in homes_with_tariffs}
+
+    # Tariff prices
+    cur.execute("SELECT tariff_id, price_per_kwh FROM tariffs;")
+    tariff_price_map = {tariff_id: price for tariff_id, price in cur.fetchall()}
+
+    # Devices grouped by home
+    cur.execute("SELECT home_id, device_id FROM device;")
+    devices_by_home = {}
+    for home_id, device_id in cur.fetchall():
+        devices_by_home.setdefault(home_id, []).append(device_id)
+
+    # Homes with generator
+    cur.execute("SELECT home_id FROM generator;")
+    homes_with_generators = {row[0] for row in cur.fetchall()}
+
+    # -------------------------------------------------------------
+    # Insert mock anomalies
+    # -------------------------------------------------------------
+    anomaly_types = [
+        "power_spike",
+        "low_generation",
+        "battery_drain",
+        "device_failure",
+        "voltage_drop"
+    ]
+    severity_levels = ["low", "medium", "high", "critical"]
+
+    for _ in range(50):
+        home_id = random.choice(home_ids)
+
+        # Choose device only from the same home
+        home_devices = devices_by_home.get(home_id, [])
+        device_id = random.choice(home_devices) if home_devices and random.random() < 0.7 else None
+
+        anomaly_type = random.choice(anomaly_types)
+        severity = random.choice(severity_levels)
+        timestamp = datetime.now() - timedelta(
+            days=random.randint(0, 30),
+            hours=random.randint(0, 23),
+            minutes=random.randint(0, 59)
+        )
+        description = f"Mock anomaly: {anomaly_type.replace('_', ' ')} detected in home {home_id}"
+        resolved = random.choice([True, False])
+
+        cur.execute("""
+            INSERT INTO anomalies
+                (home_id, device_id, timestamp, anomaly_type, description, severity, resolved)
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
+        """, (
+            home_id,
+            device_id,
+            timestamp,
+            anomaly_type,
+            description,
+            severity,
+            resolved
+        ))
+
+    # -------------------------------------------------------------
+    # Insert mock energy bills
+    # -------------------------------------------------------------
+    today = datetime.now().date()
+
+    for home_id in home_ids:
+        tariff_id = home_tariff_map[home_id]
+        price_per_kwh = tariff_price_map[tariff_id]
+        has_generator = home_id in homes_with_generators
+
+        for month_offset in range(6):
+            billing_period_end = today - timedelta(days=month_offset * 30)
+            billing_period_start = billing_period_end - timedelta(days=30)
+
+            total_consumption_kwh = round(random.uniform(150, 600), 2)
+            generation_kwh = round(random.uniform(50, 250), 2) if has_generator else 0.0
+            grid_import_kwh = round(max(total_consumption_kwh - generation_kwh, 0), 2)
+            grid_export_kwh = round(random.uniform(0, 50), 2) if has_generator else 0.0
+            total_cost = round(grid_import_kwh * price_per_kwh, 2)
+
+            cur.execute("""
+                INSERT INTO energy_bills
+                    (home_id, tariff_id, billing_period_start, billing_period_end,
+                     total_consumption_kwh, total_cost, generation_kwh,
+                     grid_import_kwh, grid_export_kwh)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """, (
+                home_id,
+                tariff_id,
+                billing_period_start,
+                billing_period_end,
+                total_consumption_kwh,
+                total_cost,
+                generation_kwh,
+                grid_import_kwh,
+                grid_export_kwh
+            ))
+
+
 
 
 # ---------------------------------------------------------------------
