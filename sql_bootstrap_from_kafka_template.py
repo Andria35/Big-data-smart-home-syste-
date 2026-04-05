@@ -335,7 +335,6 @@ def insert_data(cur, data):
         "device_failure",
         "voltage_drop"
     ]
-    severity_levels = ["low", "medium", "high", "critical"]
 
     for _ in range(50):
         home_id = random.choice(home_ids)
@@ -345,13 +344,13 @@ def insert_data(cur, data):
         device_id = random.choice(home_devices) if home_devices and random.random() < 0.7 else None
 
         anomaly_type = random.choice(anomaly_types)
-        severity = random.choice(severity_levels)
+        severity = random.randint(1, 5)  # matches INT CHECK (severity BETWEEN 1 AND 5)
         timestamp = datetime.now() - timedelta(
             days=random.randint(0, 30),
             hours=random.randint(0, 23),
             minutes=random.randint(0, 59)
         )
-        description = f"Mock anomaly: {anomaly_type.replace('_', ' ')} detected in home {home_id}"
+        description = f"Detected {anomaly_type} with severity {severity}"
         resolved = random.choice([True, False])
 
         cur.execute("""
