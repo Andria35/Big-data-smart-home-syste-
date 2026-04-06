@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
@@ -65,14 +63,32 @@ df_parsed = df.selectExpr("CAST(value AS STRING)") \
 # -----------------------------
 # Processing logic
 # -----------------------------
+# Keep old fields/logic, but make it safer and add a few extra derived metrics
 df_processed = df_parsed \
-    .withColumn("power", col("V") * col("I")) \
-    .withColumn("energy_kwh", col("E") / 1000.0)
+    .filter(col("tm").isNotNull()) \
+    .filter(col("id_disp").isNotNull()) \
+    .withColumn("E_safe", coalesce(col("E"), lit(0.0))) \
+    .withColumn("V_safe", coalesce(col("V"), lit(0.0))) \
+    .withColumn("I_safe", coalesce(col("I"), lit(0.0))) \
+    .withColumn("Pmax_safe", coalesce(col("Pmax"), lit(0.0))) \
+    .withColumn("power", col("V_safe") * col("I_safe")) \
+    .withColumn("energy_kwh", col("E_safe") / 1000.0) \
+    .withColumn("abs_power", abs(col("power"))) \
+    .withColumn("energy_abs_kwh", abs(col("energy_kwh"))) \
+    .withColumn("has_measurements", when((col("V").isNotNull()) & (col("I").isNotNull()), lit(1)).otherwise(lit(0))) \
+    .withColumn("low_voltage_flag", when((col("V").isNotNull()) & (col("V") < 210), lit(1)).otherwise(lit(0))) \
+    .withColumn("high_power_flag", when(abs(col("power")) > 3000, lit(1)).otherwise(lit(0)))
 
 # -----------------------------
 # Write to InfluxDB
 # -----------------------------
 def write_to_influx(batch_df, batch_id):
+    if batch_df.rdd.isEmpty():
+        print(f"Batch {batch_id}: empty batch, skipping.")
+        return
+
+    print(f"Processing batch {batch_id}...")
+
     url = "http://localhost:8086"
     token = os.environ["INFLUX_TOKEN"]
     org = os.environ["INFLUX_ORG"]
@@ -82,33 +98,59 @@ def write_to_influx(batch_df, batch_id):
     write_api = client.write_api(write_options=SYNCHRONOUS)
 
     rows = batch_df.collect()
+    print(f"Batch {batch_id}: {len(rows)} rows")
 
     for row in rows:
         try:
+            hogar = str(row["hogar"]) if row["hogar"] is not None else "unknown"
+            tipo_disp = str(row["tipo_disp"]) if row["tipo_disp"] is not None else "unknown"
+            id_disp = str(row["id_disp"]) if row["id_disp"] is not None else "unknown"
+
+            energy_wh = float(row["E_safe"]) if row["E_safe"] is not None else 0.0
+            energy_kwh = float(row["energy_kwh"]) if row["energy_kwh"] is not None else 0.0
+            power_calc = float(row["power"]) if row["power"] is not None else 0.0
+            pmax = float(row["Pmax_safe"]) if row["Pmax_safe"] is not None else 0.0
+            voltage = float(row["V_safe"]) if row["V_safe"] is not None else 0.0
+            current = float(row["I_safe"]) if row["I_safe"] is not None else 0.0
+
+            # Extra fields, safe to add without breaking existing Grafana panels
+            abs_power = float(row["abs_power"]) if row["abs_power"] is not None else 0.0
+            energy_abs_kwh = float(row["energy_abs_kwh"]) if row["energy_abs_kwh"] is not None else 0.0
+            has_measurements = int(row["has_measurements"]) if row["has_measurements"] is not None else 0
+            low_voltage_flag = int(row["low_voltage_flag"]) if row["low_voltage_flag"] is not None else 0
+            high_power_flag = int(row["high_power_flag"]) if row["high_power_flag"] is not None else 0
+
             point = Point("electricidad") \
-                .tag("hogar", str(row["hogar"])) \
-                .tag("tipo_disp", str(row["tipo_disp"])) \
-                .tag("id_disp", str(row["id_disp"])) \
-                .field("energy_wh", float(row["E"]) if row["E"] is not None else 0.0) \
-                .field("energy_kwh", float(row["energy_kwh"]) if row["energy_kwh"] is not None else 0.0) \
-                .field("power_calc", float(row["power"]) if row["power"] is not None else 0.0) \
-                .field("Pmax", float(row["Pmax"]) if row["Pmax"] is not None else 0.0) \
-                .field("voltage", float(row["V"]) if row["V"] is not None else 0.0) \
-                .field("current", float(row["I"]) if row["I"] is not None else 0.0) \
+                .tag("hogar", hogar) \
+                .tag("tipo_disp", tipo_disp) \
+                .tag("id_disp", id_disp) \
+                .field("energy_wh", energy_wh) \
+                .field("energy_kwh", energy_kwh) \
+                .field("power_calc", power_calc) \
+                .field("Pmax", pmax) \
+                .field("voltage", voltage) \
+                .field("current", current) \
+                .field("abs_power", abs_power) \
+                .field("energy_abs_kwh", energy_abs_kwh) \
+                .field("has_measurements", has_measurements) \
+                .field("low_voltage_flag", low_voltage_flag) \
+                .field("high_power_flag", high_power_flag) \
                 .time(int(row["tm"]), WritePrecision.MS)
 
             write_api.write(bucket=bucket, record=point)
 
-            # Print for debug / verification
-            v = row["V"] if row["V"] is not None else 0.0
-            i = row["I"] if row["I"] is not None else 0.0
-            p = v * i
-            print(f"{row['hogar']} | {row['id_disp']} | P={p:.2f} W")
+            print(
+                f"{hogar} | {id_disp} | "
+                f"P={power_calc:.2f} W | "
+                f"E={energy_kwh:.3f} kWh | "
+                f"LV={low_voltage_flag} | HP={high_power_flag}"
+            )
 
         except Exception as e:
-            print(f"Error writing row: {e}")
+            print(f"Error writing row in batch {batch_id}: {e}")
 
     client.close()
+    print(f"Batch {batch_id}: write completed.")
 
 # -----------------------------
 # Streaming query
